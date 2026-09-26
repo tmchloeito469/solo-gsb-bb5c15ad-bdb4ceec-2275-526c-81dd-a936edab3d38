@@ -4,6 +4,10 @@
 收件人凭令牌取件，**内容只能被成功读取一次**。并发取件时仅有一个请求得到内容，
 其余请求以及「已撤回 / 已过期 / 已消费」都会得到明确、可区分的结果。
 
+此外支持 **盲投递请求**：由 *收件人* 先创建一个空投递槽，得到 **一次性提交令牌**
+（交给提交者）与 **私有取件令牌**（自己留存）。提交令牌只能成功写入一份内容，
+取件令牌在内容提交前返回 `pending`，提交后同样只能成功读取一次。
+
 - **FastAPI**（异步 HTTP + 自动 OpenAPI 文档）
 - **PostgreSQL**：投递内容与审计的唯一可信存储，**原子消费的最终裁决者**
 - **Redis**：终态快速拒绝缓存（best-effort，宕机不影响正确性）
@@ -47,6 +51,11 @@ docker compose down -v
 | `POST` | `/api/v1/deliveries/file` | 创建小文件投递（multipart/form-data） |
 | `POST` | `/api/v1/pickup/{token}` | 凭令牌取件（**只能成功一次**） |
 | `POST` | `/api/v1/revoke/{token}` | 发送者撤回投递 |
+| `POST` | `/api/v1/drop-requests` | 收件人创建盲投递空槽（返回提交/取件两类令牌） |
+| `POST` | `/api/v1/drop-requests/submit/{submit_token}` | 提交者写入文本（**仅一个提交者成功**） |
+| `POST` | `/api/v1/drop-requests/submit-file/{submit_token}` | 提交者写入小文件（multipart/form-data） |
+| `POST` | `/api/v1/drop-requests/pickup/{pickup_token}` | 收件人取件（未提交返回 `pending`） |
+| `POST` | `/api/v1/drop-requests/revoke/{pickup_token}` | 收件人撤回盲投递请求 |
 | `GET` | `/api/v1/audit/export` | 按时间范围导出审计链记录（**NDJSON 流**，只读） |
 | `GET` | `/api/v1/audit/verify` | 校验库内审计链完整性（只读） |
 | `POST` | `/api/v1/audit/verify` | 校验一份导出的 NDJSON（按行顺序，可发现乱序） |
@@ -144,6 +153,105 @@ curl -s -X POST "http://localhost:8000/api/v1/revoke/<token>"
 
 ---
 
+## 盲投递请求（收件人发起的空槽）
+
+普通投递是「发送者创建、收件人取件」；盲投递请求则相反：**收件人先创建一个
+空投递槽**，把一次性提交令牌交给提交者（可公开张贴，谁先提交谁得），自己
+留存私有取件令牌等待内容到达。
+
+### 流程与状态机
+
+```
+收件人 POST /api/v1/drop-requests
+   → 得到 submit_token（交给提交者）与 pickup_token（收件人自留）
+
+awaiting ──提交者写入──▶ submitted ──收件人取件──▶ consumed
+   │                       │
+   └──收件人撤回──▶ revoked ◀──收件人撤回──┘
+   └──到期──▶ expired ◀──到期──┘
+```
+
+- 两类令牌**分别哈希存储**在 `submit_token_hash` / `pickup_token_hash` 两个
+  独立列：提交接口只按提交令牌查找，取件/撤回接口只按取件令牌查找，
+  **任何接口不得互换权限**（拿提交令牌去取件只会得到 `404 unknown`）；
+- 提交是数据库条件更新裁决的**一次性写入**：并发提交、收件人撤回与过期
+  三者竞争时只有一个提交者成功，失败方得到明确的 `submitted` / `revoked` /
+  `expired`；
+- 取件在内容提交前返回 `202 pending`（非终态，可稍后重试），提交后沿用
+  与普通投递完全相同的原子单次取件。
+
+### 提交接口的明确结果
+
+| `result` | 含义 | HTTP 状态码 |
+| --- | --- | --- |
+| `success` | 本次提交被接受（唯一赢家） | `201` |
+| `submitted` | 槽内已有一份成功提交，提交令牌已失效 | `409 Conflict` |
+| `revoked` | 收件人已撤回该请求 | `409 Conflict` |
+| `expired` | 请求已过期 | `410 Gone` |
+| `unknown` | 提交令牌不存在 | `404 Not Found` |
+
+### 取件接口的明确结果
+
+| `result` | 含义 | HTTP 状态码 |
+| --- | --- | --- |
+| `pending` | 内容尚未提交，可稍后重试 | `202 Accepted` |
+| `success` | 取件成功（文本 JSON / 文件二进制流），仅一次 | `200` |
+| `consumed` | 内容已被取走 | `410 Gone` |
+| `revoked` | 请求已被撤回 | `409 Conflict` |
+| `expired` | 请求已过期 | `410 Gone` |
+| `unknown` | 取件令牌不存在 | `404 Not Found` |
+
+撤回接口：成功 `200 {"result":"revoked"}`（重复撤回幂等返回
+`already_revoked`）；已被取走 `410 consumed`；已过期 `410 expired`；
+令牌不存在 `404 unknown`。
+
+### 调用示例
+
+```bash
+# 1) 收件人创建空槽（两个明文令牌仅此一次返回）
+curl -s -X POST http://localhost:8000/api/v1/drop-requests \
+  -H 'Content-Type: application/json' \
+  -d '{"ttl_seconds": 3600}'
+```
+
+```json
+{
+  "request_id": "3fa8…-…-…",
+  "submit_token": "kQ2w…提交令牌，交给提交者…",
+  "pickup_token": "Zz9x…取件令牌，收件人自留…",
+  "expires_at": "2026-09-26T11:00:00Z",
+  "submit_url": "http://localhost:8000/api/v1/drop-requests/submit/kQ2w…",
+  "pickup_url": "http://localhost:8000/api/v1/drop-requests/pickup/Zz9x…"
+}
+```
+
+```bash
+# 2) 收件人轮询：内容未提交前返回 pending
+curl -s -X POST "http://localhost:8000/api/v1/drop-requests/pickup/Zz9x…" -i
+# HTTP/1.1 202 Accepted
+# {"result":"pending","detail":"内容尚未提交，请稍后重试。"}
+
+# 3) 提交者写入文本（或改用 submit-file 上传小文件）
+curl -s -X POST "http://localhost:8000/api/v1/drop-requests/submit/kQ2w…" \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "这是提交者写入的内容"}'
+# 201 {"result":"success","request_id":"3fa8…","submitted_at":"…"}
+
+curl -s -X POST "http://localhost:8000/api/v1/drop-requests/submit-file/kQ2w…" \
+  -F 'file=@/path/to/evidence.zip'
+
+# 4) 收件人取件（成功仅一次）
+curl -s -X POST "http://localhost:8000/api/v1/drop-requests/pickup/Zz9x…"
+# {"result":"success","request_id":"3fa8…","kind":"text",
+#  "content":"这是提交者写入的内容","content_sha256":"…","consumed_at":"…"}
+
+# 5) 收件人撤回（提交前或提交后未取件均可）
+curl -s -X POST "http://localhost:8000/api/v1/drop-requests/revoke/Zz9x…"
+# 200 {"result":"revoked", ...}
+```
+
+---
+
 ## 并发原子消费是如何保证的
 
 这是本服务的核心。正确性**只依赖 PostgreSQL 的单条条件更新**，不依赖应用层锁：
@@ -178,6 +286,32 @@ RETURNING id, content, …;
 要么内容被取走（撤回得到 `consumed`），要么撤回先成功（取件得到 `revoked`），
 不会出现“既取走又撤回”。
 
+盲投递请求的提交/取件/撤回也走同一模式，只是 `WHERE` 条件分别落在
+`submit_token_hash` / `pickup_token_hash` 列上：
+
+```sql
+-- 提交：只有空槽（awaiting）且未过期才能被写入，并发下只有一个提交者命中
+UPDATE drop_requests
+SET status = 'submitted', content = :content, …, submitted_at = now
+WHERE submit_token_hash = :submit_token_hash
+  AND status = 'awaiting'
+  AND expires_at > now
+RETURNING id, submitted_at;
+
+-- 取件：只有已提交（submitted）且未过期才能被消费
+UPDATE drop_requests
+SET status = 'consumed', consumed_at = now
+WHERE pickup_token_hash = :pickup_token_hash
+  AND status = 'submitted'
+  AND expires_at > now
+RETURNING id, content, …;
+```
+
+撤回与过期针对 `awaiting` / `submitted` 两个活状态，因此「提交 vs 撤回」
+并发时：要么提交先成功、撤回随后拒收已提交内容（两者都成功，取件得到
+`revoked`），要么撤回先成功、提交得到 `409 revoked`——绝不出现
+“既提交成功又被静默撤回后还能取到内容”的中间态。
+
 ---
 
 ## 审计与可验证完整性（哈希链）
@@ -185,9 +319,12 @@ RETURNING id, content, …;
 所有关键动作写入 `audit_logs` 表，并且**每一条新日志（包括未知令牌等失败
 请求）都在同一个 PostgreSQL 事务中加入一条只增哈希链**：
 
-- 动作：`create` / `pickup` / `revoke`
-- 结果：`success` / `consumed` / `revoked` / `expired` / `unknown`
-- 关联 `delivery_id`（可空）、`token_hash`、客户端 IP、User-Agent、时间与少量详情
+- 动作：`create` / `pickup` / `revoke`（普通投递），
+  `drop_create` / `drop_submit` / `drop_pickup` / `drop_revoke`（盲投递请求）
+- 结果：`success` / `consumed` / `revoked` / `expired` / `unknown`，
+  以及盲投递特有的 `submitted`（重复提交被拒）/ `pending`（空槽取件）
+- 关联 `delivery_id`（可空）、`token_hash`、客户端 IP、User-Agent、时间与少量详情；
+  盲投递请求的 `request_id` 记录在 `detail` 中（`delivery_id` 仅关联普通投递）
 - **未知令牌的尝试也留痕并入链**（`delivery_id` 为空、仅记录哈希），便于暴力探测审计
 
 明文内容不写入审计，也不会出现在任何导出/校验数据中。
@@ -285,7 +422,11 @@ curl -s -X POST --data-binary @audit.ndjson \
 - 令牌为 32 字节 `secrets.token_urlsafe(32)`，库中仅存其 **SHA-256**；
 - 内容存 PostgreSQL `bytea`，同时记录大小与 SHA-256；
 - 状态机：`active → consumed | revoked | expired`，单向不可逆；
-- `(status, expires_at)` 与 `token_hash` 建有索引，支撑并发判定与清扫；
+- 盲投递请求（`drop_requests` 表）：`awaiting → submitted → consumed`，
+  活状态（`awaiting`/`submitted`）可被撤回或过期裁决为 `revoked`/`expired`；
+  提交/取件两类令牌哈希分别存于 `submit_token_hash` / `pickup_token_hash`
+  两个唯一列，提交前内容字段全部为空（空槽）；
+- `(status, expires_at)` 与令牌哈希建有索引，支撑并发判定与清扫；
 - `audit_logs` 额外保存 `seq / event_digest / prev_hash / entry_hash`
   （链字段），链游标存于单行表 `audit_chain_state`，表结构在启动时
   自动创建并种子化创世游标。
@@ -321,8 +462,11 @@ pytest
 包含 **50 路并发取件仅有一个赢家**、**取件/撤回并发互斥**、撤回、过期、
 文件一次性下载、未知令牌与审计留痕，以及**哈希链入链/导出 NDJSON/五类
 篡改检测（缺行、乱序、重复、字段改写、链断裂并指出第一处）/40 路并发
-写入序号严格连续/链游标竞态失配重试**等用例。另在真实 PostgreSQL 上验证过
-100 路并发取件恰好 1 个赢家、30 组取件/撤回互斥。
+写入序号严格连续/链游标竞态失配重试**等用例。盲投递请求覆盖：**50 路并发
+提交仅有一个赢家**、提交/撤回并发终态一致、提交前取件返回 `pending`、
+两类令牌权限互不通用、撤回幂等、过期槽提交/取件/撤回均为 `expired`、
+文件提交与一次性下载、四类动作全部入链且链校验通过。另在真实
+PostgreSQL 上验证过 100 路并发取件恰好 1 个赢家、30 组取件/撤回互斥。
 
 ---
 

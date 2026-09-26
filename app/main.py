@@ -1,9 +1,12 @@
-"""FastAPI 应用：创建 / 取件 / 撤回 / 健康检查。
+"""FastAPI 应用：创建 / 取件 / 撤回 / 盲投递请求 / 健康检查。
 
 原子消费链路：
     请求 → Redis 终态标记快速拒绝（best-effort）
          → PostgreSQL 单条条件 UPDATE ... RETURNING（正确性的唯一裁决）
          → 成功后回写 Redis 终态标记
+
+盲投递请求（drop-requests）复用同一裁决模式：提交、取件、撤回分别只按
+submit_token_hash / pickup_token_hash 列做条件更新，两类令牌权限不可互换。
 """
 
 from __future__ import annotations
@@ -39,18 +42,34 @@ from .audit_chain import (
 )
 from .config import Settings, get_settings
 from .db import Database
-from .models import Delivery
+from .models import Delivery, DropRequest
 from .redis_client import DenyCache, create_redis
 from .schemas import (
     AuditVerifyResponse,
+    CreateDropRequestRequest,
     CreateResponse,
     CreateTextRequest,
     DenyResponse,
+    DropPendingResponse,
+    DropRequestCreatedResponse,
+    DropRevokeResponse,
+    DropSubmitResponse,
+    DropSubmitTextRequest,
+    DropTextPickupResponse,
     HealthResponse,
     RevokeResponse,
     TextPickupResponse,
 )
-from .store import CONSUMED, EXPIRED, REVOKED, UNKNOWN, DeliveryStore
+from .store import (
+    CONSUMED,
+    EXPIRED,
+    PENDING,
+    REVOKED,
+    SUBMITTED,
+    UNKNOWN,
+    DeliveryStore,
+    DropRequestStore,
+)
 from .utils import (
     client_ip,
     content_disposition,
@@ -69,11 +88,31 @@ _DENY_STATUS = {
     EXPIRED: status.HTTP_410_GONE,
     REVOKED: status.HTTP_409_CONFLICT,
     UNKNOWN: status.HTTP_404_NOT_FOUND,
+    SUBMITTED: status.HTTP_409_CONFLICT,
 }
 _DENY_DETAIL = {
     CONSUMED: "该令牌已被成功取件，内容仅可读取一次。",
     EXPIRED: "投递已过期，内容不可再读取。",
     REVOKED: "投递已被发送者撤回。",
+    UNKNOWN: "取件令牌不存在。",
+}
+
+# 盲投递请求：按接口角色给出准确措辞的明确结果
+_DROP_SUBMIT_DENY_DETAIL = {
+    SUBMITTED: "该投递槽已有一份成功提交，提交令牌已失效。",
+    REVOKED: "收件人已撤回该投递请求，无法再提交。",
+    EXPIRED: "投递请求已过期，无法再提交。",
+    UNKNOWN: "提交令牌不存在。",
+}
+_DROP_PICKUP_DENY_DETAIL = {
+    CONSUMED: "内容已被成功取件，仅可读取一次。",
+    REVOKED: "该投递请求已被撤回。",
+    EXPIRED: "投递请求已过期，内容不可再读取。",
+    UNKNOWN: "取件令牌不存在。",
+}
+_DROP_REVOKE_DENY_DETAIL = {
+    CONSUMED: "内容已被取件，无法撤回。",
+    EXPIRED: "投递请求已过期，无需撤回。",
     UNKNOWN: "取件令牌不存在。",
 }
 
@@ -89,6 +128,11 @@ async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
 
 def get_store(session: AsyncSession = Depends(get_db)) -> DeliveryStore:
     return DeliveryStore(session)
+
+
+def get_drop_store(session: AsyncSession = Depends(get_db)) -> DropRequestStore:
+    # 与 get_store 共享同一请求作用域 session：状态迁移与审计追加同事务
+    return DropRequestStore(session)
 
 
 async def get_cache(request: Request) -> DenyCache:
@@ -124,6 +168,7 @@ async def _sweep_loop(db: Database, cfg: Settings, stop: asyncio.Event) -> None:
         try:
             async with db.session_factory() as session:
                 count = await DeliveryStore(session).sweep_expired()
+                count += await DropRequestStore(session).sweep_expired()
                 if count:
                     logger.info("sweep marked %d deliveries expired", count)
         except Exception:  # noqa: BLE001 - 清扫失败不应杀死进程
@@ -136,8 +181,11 @@ async def _sweep_loop(db: Database, cfg: Settings, stop: asyncio.Event) -> None:
 
 app = FastAPI(
     title="一次性内容投递箱 API",
-    version="1.0.0",
-    description="创建带过期时间的文本/小文件投递，取件令牌只能成功读取一次。",
+    version="1.1.0",
+    description=(
+        "创建带过期时间的文本/小文件投递，取件令牌只能成功读取一次；"
+        "支持收件人发起的盲投递请求（空槽 + 一次性提交令牌）。"
+    ),
     lifespan=lifespan,
 )
 
@@ -213,6 +261,48 @@ async def _delivery_id_by_hash(session: AsyncSession, token_hash: str):
     return await session.scalar(
         select(Delivery.id).where(Delivery.token_hash == token_hash)
     )
+
+
+async def _drop_request_id_by_hash(session: AsyncSession, token_hash: str, *, role: str):
+    """快速拒绝路径下，按令牌角色列反查 request_id（仅主键，不碰内容）。
+
+    role="submit" 查 submit_token_hash 列，否则查 pickup_token_hash 列；
+    两个角色永远不会交叉查询，保证权限不可互换。
+    """
+    column = (
+        DropRequest.submit_token_hash if role == "submit" else DropRequest.pickup_token_hash
+    )
+    return await session.scalar(select(DropRequest.id).where(column == token_hash))
+
+
+def _drop_deny(result: str, detail_map: dict[str, str]) -> JSONResponse:
+    """盲投递请求的统一明确失败结果（状态码与投递接口同一套映射）。"""
+    return JSONResponse(
+        status_code=_DENY_STATUS[result],
+        content=DenyResponse(result=result, detail=detail_map[result]).model_dump(mode="json"),
+    )
+
+
+async def _audit_drop_flag(
+    store: DeliveryStore,
+    request: Request,
+    *,
+    action: str,
+    flag: str,
+    token_hash: str,
+    role: str,
+) -> None:
+    """Redis 终态快速拒绝路径：反查 request_id 后入链并提交。"""
+    request_id = await _drop_request_id_by_hash(store.session, token_hash, role=role)
+    await _audit(
+        store,
+        action=action,
+        result=flag,
+        request=request,
+        token_hash=token_hash,
+        detail={"request_id": str(request_id)} if request_id else None,
+    )
+    await store.session.commit()
 
 
 # ---------------- 创建 ----------------
@@ -501,6 +591,391 @@ async def revoke(
     return _deny(UNKNOWN)
 
 
+# ---------------- 盲投递请求（收件人发起的空槽） ----------------
+
+
+@app.post(
+    "/api/v1/drop-requests",
+    response_model=DropRequestCreatedResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["drop-requests"],
+    summary="收件人创建盲投递空槽（返回一次性提交令牌与私有取件令牌）",
+)
+async def create_drop_request(
+    payload: CreateDropRequestRequest,
+    request: Request,
+    store: DeliveryStore = Depends(get_store),
+    drops: DropRequestStore = Depends(get_drop_store),
+    cfg: Settings = Depends(get_settings),
+) -> DropRequestCreatedResponse:
+    _validate_ttl(payload.ttl_seconds, cfg)
+
+    submit_token, submit_h = new_token()
+    pickup_token, pickup_h = new_token()
+    expires_at = utcnow() + timedelta(seconds=payload.ttl_seconds)
+
+    req = await drops.create(
+        submit_token_hash=submit_h,
+        pickup_token_hash=pickup_h,
+        expires_at=expires_at,
+    )
+    await _audit(
+        store,
+        action="drop_create",
+        result="success",
+        request=request,
+        token_hash=pickup_h,
+        detail={
+            "request_id": str(req.id),
+            "submit_token_hash": submit_h,
+            "ttl_seconds": payload.ttl_seconds,
+        },
+    )
+    await store.session.commit()
+
+    base = str(request.base_url).rstrip("/")
+    return DropRequestCreatedResponse(
+        request_id=req.id,
+        submit_token=submit_token,
+        pickup_token=pickup_token,
+        expires_at=expires_at,
+        submit_url=f"{base}/api/v1/drop-requests/submit/{submit_token}",
+        pickup_url=f"{base}/api/v1/drop-requests/pickup/{pickup_token}",
+    )
+
+
+async def _finish_submit(
+    store: DeliveryStore,
+    cache: DenyCache,
+    request: Request,
+    *,
+    won: bool,
+    state: str,
+    row,
+    token_hash: str,
+    cfg: Settings,
+    kind: str,
+    size: int,
+    filename: str | None = None,
+):
+    """文本/文件提交共享的收尾：审计、终态缓存与明确响应。"""
+    if won:
+        detail: dict = {"request_id": str(row.id), "kind": kind, "size": size}
+        if filename:
+            detail["filename"] = filename
+        await _audit(
+            store,
+            action="drop_submit",
+            result="success",
+            request=request,
+            token_hash=token_hash,
+            detail=detail,
+        )
+        await store.session.commit()
+        # 提交令牌自此失效（终态 submitted），缓存以快速拒绝重复提交
+        await _remember_terminal(cache, token_hash, SUBMITTED, cfg)
+        return DropSubmitResponse(
+            request_id=row.id,
+            submitted_at=ensure_utc(row.submitted_at) or utcnow(),
+        )
+
+    # 失败方得到明确结果；consumed 对提交者映射为 submitted，
+    # 不泄露“收件人是否已读”
+    result = SUBMITTED if state == CONSUMED else state
+    request_id = getattr(row, "id", None)
+    await _audit(
+        store,
+        action="drop_submit",
+        result=result,
+        request=request,
+        token_hash=token_hash,
+        detail={"request_id": str(request_id)} if request_id else None,
+    )
+    await store.session.commit()
+    if state != UNKNOWN:
+        await _remember_terminal(cache, token_hash, result, cfg)
+    return _drop_deny(result, _DROP_SUBMIT_DENY_DETAIL)
+
+
+@app.post(
+    "/api/v1/drop-requests/submit/{submit_token}",
+    response_model=DropSubmitResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["drop-requests"],
+    summary="提交者凭一次性提交令牌写入文本（仅一个提交者成功）",
+    responses={
+        409: {"model": DenyResponse, "description": "已被提交（submitted）或已撤回（revoked）"},
+        410: {"model": DenyResponse, "description": "已过期"},
+        404: {"model": DenyResponse, "description": "提交令牌不存在"},
+        413: {"description": "内容超过大小上限"},
+    },
+)
+async def submit_drop_text(
+    submit_token: str,
+    payload: DropSubmitTextRequest,
+    request: Request,
+    store: DeliveryStore = Depends(get_store),
+    drops: DropRequestStore = Depends(get_drop_store),
+    cache: DenyCache = Depends(get_cache),
+    cfg: Settings = Depends(get_settings),
+):
+    token_h = hash_token(submit_token)
+
+    # 1) Redis 快速拒绝（已知终态：submitted / revoked / expired）
+    if flag := await _fast_flag(cache, token_h):
+        await _audit_drop_flag(
+            store, request, action="drop_submit", flag=flag,
+            token_hash=token_h, role="submit",
+        )
+        return _drop_deny(flag, _DROP_SUBMIT_DENY_DETAIL)
+
+    content = payload.text.encode("utf-8")
+    _check_size(len(content), cfg)
+
+    # 2) 数据库条件更新裁决：并发提交/撤回/过期只有一个赢家
+    won, state, row = await drops.submit(
+        token_h,
+        kind="text",
+        content=content,
+        content_type="text/plain; charset=utf-8",
+        content_sha256=sha256_hex(content),
+    )
+    return await _finish_submit(
+        store, cache, request,
+        won=won, state=state, row=row,
+        token_hash=token_h, cfg=cfg, kind="text", size=len(content),
+    )
+
+
+@app.post(
+    "/api/v1/drop-requests/submit-file/{submit_token}",
+    response_model=DropSubmitResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["drop-requests"],
+    summary="提交者凭一次性提交令牌写入小文件（multipart/form-data）",
+    responses={
+        409: {"model": DenyResponse, "description": "已被提交（submitted）或已撤回（revoked）"},
+        410: {"model": DenyResponse, "description": "已过期"},
+        404: {"model": DenyResponse, "description": "提交令牌不存在"},
+        413: {"description": "文件超过大小上限"},
+    },
+)
+async def submit_drop_file(
+    submit_token: str,
+    request: Request,
+    file: UploadFile = File(..., description="要写入空槽的小文件"),
+    store: DeliveryStore = Depends(get_store),
+    drops: DropRequestStore = Depends(get_drop_store),
+    cache: DenyCache = Depends(get_cache),
+    cfg: Settings = Depends(get_settings),
+):
+    token_h = hash_token(submit_token)
+
+    if flag := await _fast_flag(cache, token_h):
+        await _audit_drop_flag(
+            store, request, action="drop_submit", flag=flag,
+            token_hash=token_h, role="submit",
+        )
+        return _drop_deny(flag, _DROP_SUBMIT_DENY_DETAIL)
+
+    # 流式读取，最多多读 1 字节以判定超限，避免把超大文件整块载入内存
+    max_bytes = cfg.max_content_bytes
+    chunks: list[bytes] = []
+    total = 0
+    oversize = False
+    while chunk := await file.read(64 * 1024):
+        total += len(chunk)
+        if total > max_bytes:
+            oversize = True
+            break
+        chunks.append(chunk)
+    if oversize:
+        _check_size(max_bytes + 1, cfg)  # 统一抛出 413
+
+    content = b"".join(chunks)
+    filename = (file.filename or "file.bin")[:255]
+    content_type = (file.content_type or "application/octet-stream")[:255]
+
+    won, state, row = await drops.submit(
+        token_h,
+        kind="file",
+        content=content,
+        filename=filename,
+        content_type=content_type,
+        content_sha256=sha256_hex(content),
+    )
+    return await _finish_submit(
+        store, cache, request,
+        won=won, state=state, row=row,
+        token_hash=token_h, cfg=cfg, kind="file", size=total, filename=filename,
+    )
+
+
+@app.post(
+    "/api/v1/drop-requests/pickup/{pickup_token}",
+    tags=["drop-requests"],
+    summary="收件人凭私有取件令牌取件（未提交返回 pending，成功仅一次）",
+    responses={
+        200: {"description": "取件成功（文本返回 JSON，文件返回二进制流）"},
+        202: {"model": DropPendingResponse, "description": "内容尚未提交（pending）"},
+        409: {"model": DenyResponse, "description": "已撤回"},
+        410: {"model": DenyResponse, "description": "已消费或已过期"},
+        404: {"model": DenyResponse, "description": "取件令牌不存在"},
+    },
+)
+async def pickup_drop_request(
+    pickup_token: str,
+    request: Request,
+    store: DeliveryStore = Depends(get_store),
+    drops: DropRequestStore = Depends(get_drop_store),
+    cache: DenyCache = Depends(get_cache),
+    cfg: Settings = Depends(get_settings),
+):
+    token_h = hash_token(pickup_token)
+
+    # 1) Redis 快速拒绝（已知终态：consumed / revoked / expired）
+    if flag := await _fast_flag(cache, token_h):
+        await _audit_drop_flag(
+            store, request, action="drop_pickup", flag=flag,
+            token_hash=token_h, role="pickup",
+        )
+        return _drop_deny(flag, _DROP_PICKUP_DENY_DETAIL)
+
+    # 2) 数据库原子消费：仅当槽已提交且未过期时命中
+    won, state, row = await drops.claim(token_h)
+
+    if not won:
+        request_id = getattr(row, "id", None)
+        await _audit(
+            store,
+            action="drop_pickup",
+            result=state,
+            request=request,
+            token_hash=token_h,
+            detail={"request_id": str(request_id)} if request_id else None,
+        )
+        await store.session.commit()
+        if state == PENDING:
+            # 空槽：非终态，不写终态缓存，收件人可稍后重试
+            return JSONResponse(
+                status_code=status.HTTP_202_ACCEPTED,
+                content=DropPendingResponse(
+                    detail="内容尚未提交，请稍后重试。"
+                ).model_dump(mode="json"),
+            )
+        if state != UNKNOWN:
+            await _remember_terminal(cache, token_h, state, cfg)
+        return _drop_deny(state, _DROP_PICKUP_DENY_DETAIL)
+
+    # 3) 赢家：内容只在此刻从事务中取出一次
+    await _audit(
+        store,
+        action="drop_pickup",
+        result="success",
+        request=request,
+        token_hash=token_h,
+        detail={"request_id": str(row.id), "kind": row.kind, "size": row.content_size},
+    )
+    await store.session.commit()
+    await _remember_terminal(cache, token_h, CONSUMED, cfg)
+
+    consumed_at = ensure_utc(row.consumed_at) or utcnow()
+    if row.kind == "file":
+        headers = {
+            "X-Drop-Result": "success",
+            "X-Content-SHA256": row.content_sha256,
+            "Content-Disposition": content_disposition(row.filename or "file.bin"),
+        }
+        return Response(
+            content=row.content,
+            media_type=row.content_type or "application/octet-stream",
+            headers=headers,
+        )
+
+    return DropTextPickupResponse(
+        request_id=row.id,
+        content=row.content.decode("utf-8"),
+        content_sha256=row.content_sha256,
+        consumed_at=consumed_at,
+    )
+
+
+@app.post(
+    "/api/v1/drop-requests/revoke/{pickup_token}",
+    response_model=DropRevokeResponse,
+    tags=["drop-requests"],
+    summary="收件人撤回盲投递请求（凭私有取件令牌）",
+    responses={
+        200: {"description": "撤回成功，或此前已撤回（幂等）"},
+        410: {"model": DenyResponse, "description": "已被取件或已过期"},
+        404: {"model": DenyResponse, "description": "取件令牌不存在"},
+    },
+)
+async def revoke_drop_request(
+    pickup_token: str,
+    request: Request,
+    store: DeliveryStore = Depends(get_store),
+    drops: DropRequestStore = Depends(get_drop_store),
+    cache: DenyCache = Depends(get_cache),
+    cfg: Settings = Depends(get_settings),
+):
+    token_h = hash_token(pickup_token)
+
+    if flag := await _fast_flag(cache, token_h):
+        request_id = await _drop_request_id_by_hash(store.session, token_h, role="pickup")
+        await _audit(
+            store,
+            action="drop_revoke",
+            result=flag,
+            request=request,
+            token_hash=token_h,
+            detail={"request_id": str(request_id)} if request_id else None,
+        )
+        await store.session.commit()
+        if flag == REVOKED:
+            return DropRevokeResponse(result="already_revoked", request_id=request_id)
+        return _drop_deny(flag, _DROP_REVOKE_DENY_DETAIL)
+
+    won, state, row = await drops.revoke(token_h)
+    request_id = getattr(row, "id", None)
+
+    if won:
+        await _audit(
+            store,
+            action="drop_revoke",
+            result=REVOKED,
+            request=request,
+            token_hash=token_h,
+            detail={"request_id": str(request_id)},
+        )
+        await store.session.commit()
+        await _remember_terminal(cache, token_h, REVOKED, cfg)
+        # 提交令牌同步失效：提交者随后得到快速的 revoked，而非打到数据库
+        await _remember_terminal(cache, row.submit_token_hash, REVOKED, cfg)
+        return DropRevokeResponse(
+            result=REVOKED,
+            request_id=request_id,
+            revoked_at=ensure_utc(row.revoked_at),
+        )
+
+    await _audit(
+        store,
+        action="drop_revoke",
+        result=state,
+        request=request,
+        token_hash=token_h,
+        detail={"request_id": str(request_id)} if request_id else None,
+    )
+    await store.session.commit()
+    if state != UNKNOWN:
+        await _remember_terminal(cache, token_h, state, cfg)
+
+    if state == REVOKED:
+        # 终态缓存缺失时的幂等撤回
+        return DropRevokeResponse(result="already_revoked", request_id=request_id)
+    return _drop_deny(state, _DROP_REVOKE_DENY_DETAIL)
+
+
 # ---------------- 审计：哈希链导出 / 校验 ----------------
 
 
@@ -708,6 +1183,11 @@ async def root() -> dict:
             "POST /api/v1/deliveries/file",
             "POST /api/v1/pickup/{token}",
             "POST /api/v1/revoke/{token}",
+            "POST /api/v1/drop-requests",
+            "POST /api/v1/drop-requests/submit/{submit_token}",
+            "POST /api/v1/drop-requests/submit-file/{submit_token}",
+            "POST /api/v1/drop-requests/pickup/{pickup_token}",
+            "POST /api/v1/drop-requests/revoke/{pickup_token}",
             "GET  /api/v1/audit/export",
             "GET  /api/v1/audit/verify",
             "POST /api/v1/audit/verify",

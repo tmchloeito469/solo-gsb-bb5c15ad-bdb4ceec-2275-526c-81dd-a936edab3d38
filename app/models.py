@@ -88,6 +88,50 @@ class Delivery(Base):
     expired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class DropRequest(Base):
+    """盲投递请求：收件人创建的空投递槽，等待提交者凭一次性提交令牌写入内容。
+
+    两类令牌分别哈希存储在两个独立列：提交接口只按 submit_token_hash
+    查找，取件/撤回接口只按 pickup_token_hash 查找，任何接口不得互换权限。
+    """
+
+    __tablename__ = "drop_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(UuidType, primary_key=True, default=uuid.uuid4)
+    # 一次性提交令牌的 SHA-256（提交者持有）；唯一索引承载并发提交竞争
+    submit_token_hash: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True
+    )
+    # 私有取件令牌的 SHA-256（收件人持有，兼具撤回能力）
+    pickup_token_hash: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True
+    )
+
+    # awaiting | submitted | consumed | revoked | expired
+    status: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="awaiting", index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    # ---- 提交后填充（提交前为空槽，全部为空）----
+    kind: Mapped[str | None] = mapped_column(String(8), nullable=True)  # text | file
+    content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    content_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
@@ -145,6 +189,8 @@ Index("ix_audit_delivery_created", AuditLog.delivery_id, AuditLog.created_at.des
 Index("ix_audit_created_seq", AuditLog.created_at, AuditLog.seq)
 # 后台清扫器扫描到期 active 行
 Index("ix_deliveries_status_expires", Delivery.status, Delivery.expires_at)
+# 后台清扫器扫描到期的 awaiting/submitted 盲投槽
+Index("ix_drop_requests_status_expires", DropRequest.status, DropRequest.expires_at)
 
 # 审计详情中的键都很小，JSONB 仅用于存储便利
 _ = text  # 保留导入，便于未来迁移脚本复用

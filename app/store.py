@@ -27,7 +27,7 @@ from .audit_chain import (
     chain_hash,
     event_digest_for,
 )
-from .models import AuditChainState, AuditLog, Delivery
+from .models import AuditChainState, AuditLog, Delivery, DropRequest
 from .utils import utcnow
 
 # 可能的结果状态
@@ -36,6 +36,13 @@ REVOKED = "revoked"
 EXPIRED = "expired"
 ACTIVE = "active"
 UNKNOWN = "unknown"
+
+# 盲投递请求状态机：awaiting -> submitted -> consumed；
+# 活状态（awaiting/submitted）可被撤回或过期裁决为 revoked / expired
+AWAITING = "awaiting"
+SUBMITTED = "submitted"
+# pending 仅是取件响应结果（空槽尚未被提交），不落库、不入终态缓存
+PENDING = "pending"
 
 _DELIVERY_COLS = (
     Delivery.id,
@@ -69,6 +76,25 @@ _CHAIN_COLS = (
 
 # 链追加的竞争重试上限（正常竞争下通常 1~2 次即完成）
 _MAX_CHAIN_ATTEMPTS = 200
+
+# 盲投槽取件赢家需要带回的列（含一次性取出的明文内容）
+_DROP_REQUEST_COLS = (
+    DropRequest.id,
+    DropRequest.status,
+    DropRequest.kind,
+    DropRequest.content,
+    DropRequest.filename,
+    DropRequest.content_type,
+    DropRequest.content_size,
+    DropRequest.content_sha256,
+    DropRequest.expires_at,
+    DropRequest.submitted_at,
+    DropRequest.consumed_at,
+    DropRequest.revoked_at,
+)
+
+# 仍可被提交（仅 awaiting）/ 撤回 / 过期裁决的"活"状态
+_DROP_LIVE_STATES = (AWAITING, SUBMITTED)
 
 
 class DeliveryStore:
@@ -422,3 +448,202 @@ class DeliveryStore:
             .where(AuditLog.seq == first_seq - 1)
         )
         return row
+
+
+class DropRequestStore:
+    """盲投递请求的数据访问层。
+
+    与 DeliveryStore 完全相同的裁决模式：所有状态迁移都是 *单条带 WHERE
+    条件的 UPDATE ... RETURNING*，由数据库行锁保证并发提交、收件人撤回与
+    过期三者竞争时只有一个赢家。审计链写入统一走 DeliveryStore.write_audit
+    （两端点注入的 store 共享同一 session）。
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def create(
+        self,
+        *,
+        submit_token_hash: str,
+        pickup_token_hash: str,
+        expires_at: datetime,
+    ) -> DropRequest:
+        req = DropRequest(
+            submit_token_hash=submit_token_hash,
+            pickup_token_hash=pickup_token_hash,
+            expires_at=expires_at,
+        )
+        self.session.add(req)
+        await self.session.flush()
+        return req
+
+    async def _lazily_expire(self, column, token_hash: str, now: datetime) -> None:
+        """把该令牌对应行中已到期的活状态提升为 expired。
+
+        与 DeliveryStore._lazily_expire 一样必须在 *独立事务* 中执行，
+        避免旧快照覆盖并发赢家刚提交的终态。
+        """
+        await self.session.execute(
+            update(DropRequest)
+            .where(
+                column == token_hash,
+                DropRequest.status.in_(_DROP_LIVE_STATES),
+                DropRequest.expires_at <= now,
+            )
+            .values(status=EXPIRED, expired_at=now)
+        )
+        await self.session.commit()
+
+    async def submit(
+        self,
+        submit_token_hash: str,
+        *,
+        kind: str,
+        content: bytes,
+        filename: str | None = None,
+        content_type: str | None = None,
+        content_sha256: str,
+    ) -> tuple[bool, str, DropRequest | None]:
+        """原子写入空槽：并发下只有一个提交者成功。
+
+        返回 (won, state, row)：
+        - won=True  本次写入成功，槽状态推进为 submitted；
+        - won=False state 为明确失败原因：submitted（已被他人提交）/
+                    consumed（已提交且已被取件，由上层对提交者映射为
+                    submitted，不泄露收件人是否已读）/ revoked / expired /
+                    unknown。
+        """
+        now = utcnow()
+        result = await self.session.execute(
+            update(DropRequest)
+            .where(
+                DropRequest.submit_token_hash == submit_token_hash,
+                DropRequest.status == AWAITING,
+                DropRequest.expires_at > now,
+            )
+            .values(
+                status=SUBMITTED,
+                kind=kind,
+                content=content,
+                filename=filename,
+                content_type=content_type,
+                content_size=len(content),
+                content_sha256=content_sha256,
+                submitted_at=now,
+            )
+            .returning(DropRequest.id, DropRequest.status, DropRequest.submitted_at)
+        )
+        row = result.first()
+        if row is not None:
+            await self.session.commit()
+            return True, SUBMITTED, row
+
+        await self.session.commit()
+        await self._lazily_expire(DropRequest.submit_token_hash, submit_token_hash, now)
+
+        current = (
+            await self.session.execute(
+                select(DropRequest).where(
+                    DropRequest.submit_token_hash == submit_token_hash
+                )
+            )
+        ).scalar_one_or_none()
+        if current is None:
+            return False, UNKNOWN, None
+        return False, current.status, current
+
+    async def claim(self, pickup_token_hash: str) -> tuple[bool, str, DropRequest | None]:
+        """原子取件（仅当内容已提交）。返回 (won, state, row)。
+
+        won=False 时 state 为 pending（空槽或极端竞态下未抢到，均提示
+        稍后重试，非终态）/ consumed / revoked / expired / unknown。
+        """
+        now = utcnow()
+        result = await self.session.execute(
+            update(DropRequest)
+            .where(
+                DropRequest.pickup_token_hash == pickup_token_hash,
+                DropRequest.status == SUBMITTED,
+                DropRequest.expires_at > now,
+            )
+            .values(status=CONSUMED, consumed_at=now)
+            .returning(*_DROP_REQUEST_COLS)
+        )
+        row = result.first()
+        if row is not None:
+            await self.session.commit()
+            return True, CONSUMED, row
+
+        await self.session.commit()
+        await self._lazily_expire(DropRequest.pickup_token_hash, pickup_token_hash, now)
+
+        current = (
+            await self.session.execute(
+                select(DropRequest).where(
+                    DropRequest.pickup_token_hash == pickup_token_hash
+                )
+            )
+        ).scalar_one_or_none()
+        if current is None:
+            return False, UNKNOWN, None
+        if current.status in _DROP_LIVE_STATES:
+            # awaiting：空槽等待提交；submitted：本次 UPDATE 后他人才提交
+            # 成功的极端竞态。两者都让收件人稍后重试即可。
+            return False, PENDING, current
+        return False, current.status, current
+
+    async def revoke(self, pickup_token_hash: str) -> tuple[bool, str, DropRequest | None]:
+        """收件人原子撤回（awaiting / submitted 均可撤）。返回 (won, state, row)。
+
+        won=False 时 state 为 consumed / revoked（幂等场景，Redis 标记
+        缺失时由上层转为 already_revoked）/ expired / unknown。
+        """
+        now = utcnow()
+        result = await self.session.execute(
+            update(DropRequest)
+            .where(
+                DropRequest.pickup_token_hash == pickup_token_hash,
+                DropRequest.status.in_(_DROP_LIVE_STATES),
+                DropRequest.expires_at > now,
+            )
+            .values(status=REVOKED, revoked_at=now)
+            .returning(
+                DropRequest.id,
+                DropRequest.status,
+                DropRequest.revoked_at,
+                DropRequest.submit_token_hash,
+            )
+        )
+        row = result.first()
+        if row is not None:
+            await self.session.commit()
+            return True, REVOKED, row
+
+        await self.session.commit()
+        await self._lazily_expire(DropRequest.pickup_token_hash, pickup_token_hash, now)
+
+        current = (
+            await self.session.execute(
+                select(DropRequest).where(
+                    DropRequest.pickup_token_hash == pickup_token_hash
+                )
+            )
+        ).scalar_one_or_none()
+        if current is None:
+            return False, UNKNOWN, None
+        return False, current.status, current
+
+    async def sweep_expired(self) -> int:
+        """后台批量把到期的 awaiting/submitted 槽标记为 expired。"""
+        now = utcnow()
+        result = await self.session.execute(
+            update(DropRequest)
+            .where(
+                DropRequest.status.in_(_DROP_LIVE_STATES),
+                DropRequest.expires_at <= now,
+            )
+            .values(status=EXPIRED, expired_at=now)
+        )
+        await self.session.commit()
+        return result.rowcount or 0

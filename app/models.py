@@ -69,20 +69,28 @@ class Delivery(Base):
     id: Mapped[uuid.UUID] = mapped_column(UuidType, primary_key=True, default=uuid.uuid4)
     # 取件令牌的 SHA-256；唯一索引承载并发行锁竞争
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
-    kind: Mapped[str] = mapped_column(String(8), nullable=False)  # text | file
-    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    # 盲投递空槽的一次性提交令牌 SHA-256；普通投递恒为 NULL。
+    # 与取件令牌分别哈希、分别建唯一索引：两类令牌的权限不可互换。
+    submit_token_hash: Mapped[str | None] = mapped_column(
+        String(64), unique=True, nullable=True, index=True
+    )
+    kind: Mapped[str] = mapped_column(String(8), nullable=False)  # text | file | pending（空槽）
+    # 盲槽在内容提交前为 NULL；提交成功的条件更新会一次性写入
+    content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
     content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    content_size: Mapped[int] = mapped_column(Integer, nullable=False)
-    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
-    # active | consumed | revoked | expired
+    # active | pending | consumed | revoked | expired
+    # 盲槽生命周期：pending（空槽）→ active（已提交）→ consumed/revoked/expired
     status: Mapped[str] = mapped_column(String(10), nullable=False, default="active", index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -101,7 +109,7 @@ class AuditLog(Base):
     # 未匹配令牌的请求也需要留痕，此时只记录哈希
     token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(16), nullable=False)
-    # success | consumed | revoked | expired | unknown
+    # success | consumed | revoked | expired | unknown | pending | submitted
     result: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
     detail: Mapped[dict | None] = mapped_column(JSONBType, nullable=True)
     client_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)

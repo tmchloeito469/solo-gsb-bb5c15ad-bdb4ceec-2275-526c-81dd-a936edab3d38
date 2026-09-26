@@ -35,7 +35,12 @@ CONSUMED = "consumed"
 REVOKED = "revoked"
 EXPIRED = "expired"
 ACTIVE = "active"
+PENDING = "pending"      # 盲投递空槽：收件人已开槽，尚无提交者写入
+SUBMITTED = "submitted"  # 提交竞争失败：槽已被另一个提交者占用
 UNKNOWN = "unknown"
+
+# 盲槽内容提交成功时的 kind，空槽阶段固定为 pending
+_PENDING_KIND = PENDING
 
 _DELIVERY_COLS = (
     Delivery.id,
@@ -100,20 +105,227 @@ class DeliveryStore:
         await self.session.flush()
         return delivery
 
-    async def _lazily_expire(self, token_hash: str, now: datetime) -> bool:
-        """把 active 且已到期的行提升为 expired。
+    async def create_slot(
+        self,
+        *,
+        submit_token_hash: str,
+        pickup_token_hash: str,
+        expires_at: datetime,
+    ) -> Delivery:
+        """创建盲投递空槽：内容为空、status=pending，承载两类互不相同的令牌。
 
-        必须在 *独立事务* 中执行：调用方的读事务可能持有旧快照
-        （SQLite/REPEATABLE READ），在其中回写过期状态会覆盖
-        并发赢家刚刚提交的 consumed/revoked。
+        提交令牌只能用于 ``submit_content``（按 ``submit_token_hash`` 定位）；
+        取件令牌只能用于 ``claim_blind`` / ``revoke_blind``（按 ``token_hash``
+        定位且限定盲槽）。两条唯一索引保证令牌互不冲突、权限不可互换。
         """
+        slot = Delivery(
+            token_hash=pickup_token_hash,
+            submit_token_hash=submit_token_hash,
+            kind=_PENDING_KIND,
+            content=None,
+            content_size=None,
+            content_sha256=None,
+            status=PENDING,
+            expires_at=expires_at,
+        )
+        self.session.add(slot)
+        await self.session.flush()
+        return slot
+
+    async def submit_content(
+        self,
+        submit_token_hash: str,
+        *,
+        kind: str,
+        content: bytes,
+        filename: str | None,
+        content_type: str,
+        content_sha256: str,
+    ) -> tuple[bool, str, Delivery | None]:
+        """向盲槽一次性写入内容。并发提交由单条条件 UPDATE 裁决。
+
+        返回 (won, state, row)：
+        - won=True  本调用是唯一提交成功者，槽由 pending 原子转为 active，
+                    row 带槽 id 与过期时间（不含重复读取内容列）；
+        - won=False state 为明确失败原因：
+                    submitted（已被另一个提交者占用）/ revoked（已撤回）/
+                    expired（已过期）/ unknown（提交令牌不存在，
+                    或该令牌不具备提交权限——如拿取件令牌来提交）。
+
+        裁决语句与取件同构：PostgreSQL 用行锁串行化，仅第一个满足
+        ``submit_token_hash 匹配 AND status='pending' AND 未过期`` 的事务命中，
+        并在同一条 UPDATE 中把内容、元数据与 pending→active 一并写入，
+        因此绝不会出现“状态已激活但内容为空”的半成品槽。
+        """
+        now = utcnow()
         result = await self.session.execute(
             update(Delivery)
             .where(
-                Delivery.token_hash == token_hash,
-                Delivery.status == ACTIVE,
-                Delivery.expires_at <= now,
+                Delivery.submit_token_hash == submit_token_hash,
+                Delivery.status == PENDING,
+                Delivery.expires_at > now,
             )
+            .values(
+                status=ACTIVE,
+                kind=kind,
+                content=content,
+                filename=filename,
+                content_type=content_type,
+                content_size=len(content),
+                content_sha256=content_sha256,
+                submitted_at=now,
+            )
+            .returning(
+                Delivery.id,
+                Delivery.status,
+                Delivery.expires_at,
+                Delivery.submitted_at,
+            )
+        )
+        row = result.first()
+        if row is not None:
+            await self.session.commit()
+            # RETURNING 行已带 id / status / expires_at / submitted_at，
+            # commit 后不再回读（避免 ORM 过期属性在并发下惰性触发 IO）
+            return True, ACTIVE, row
+
+        # 未命中：结束本事务后，在独立事务里幂等地推进过期，再读终态
+        await self.session.commit()
+        await self._lazily_expire(submit_token_hash, now, by_submit_token=True, blind=True)
+
+        current = (
+            await self.session.execute(
+                select(Delivery).where(Delivery.submit_token_hash == submit_token_hash)
+            )
+        ).scalar_one_or_none()
+        if current is None:
+            return False, UNKNOWN, None
+        # active/consumed 都意味着“唯一一份内容已由他人成功写入”：
+        # 正常裁决读到 active；极端竞态（取件紧接提交后）可能读到 consumed。
+        if current.status == ACTIVE or current.status == CONSUMED:
+            return False, SUBMITTED, current
+        return False, current.status, current
+
+    async def claim_blind(
+        self, pickup_token_hash: str
+    ) -> tuple[bool, str, Delivery | None]:
+        """凭盲槽取件令牌原子取件。
+
+        与普通取件 ``claim`` 的两点差别：
+        - 只能命中盲槽（``submit_token_hash IS NOT NULL``），普通投递的
+          取件令牌在此一律 unknown，权限不互换；
+        - 盲槽尚未提交时不消费、不报错，返回 (False, 'pending', row)：
+          内容到位后沿用同一条 active→consumed 条件更新原子单次取件。
+        """
+        now = utcnow()
+        result = await self.session.execute(
+            update(Delivery)
+            .where(
+                Delivery.token_hash == pickup_token_hash,
+                Delivery.submit_token_hash.is_not(None),
+                Delivery.status == ACTIVE,
+                Delivery.expires_at > now,
+            )
+            .values(status=CONSUMED, consumed_at=now)
+            .returning(*_DELIVERY_COLS)
+        )
+        row = result.first()
+        if row is not None:
+            await self.session.commit()
+            return True, CONSUMED, row
+
+        await self.session.commit()
+        await self._lazily_expire(pickup_token_hash, now, by_submit_token=False, blind=True)
+
+        current = (
+            await self.session.execute(
+                select(Delivery).where(
+                    Delivery.token_hash == pickup_token_hash,
+                    Delivery.submit_token_hash.is_not(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if current is None:
+            return False, UNKNOWN, None
+        return False, current.status, current
+
+    async def revoke_blind(
+        self, pickup_token_hash: str
+    ) -> tuple[bool, str, Delivery | None]:
+        """收件人凭盲槽私有取件令牌撤回空槽或已提交的投递。
+
+        pending（尚未提交）与 active（已提交等待取件）均可撤回；
+        已 consumed / expired 返回相应终态；令牌不存在或属于普通投递
+        则 unknown。返回结构与 ``revoke`` 相同。
+        """
+        now = utcnow()
+        result = await self.session.execute(
+            update(Delivery)
+            .where(
+                Delivery.token_hash == pickup_token_hash,
+                Delivery.submit_token_hash.is_not(None),
+                Delivery.status.in_((PENDING, ACTIVE)),
+                Delivery.expires_at > now,
+            )
+            .values(status=REVOKED, revoked_at=now)
+            .returning(
+                Delivery.id,
+                Delivery.status,
+                Delivery.expires_at,
+                Delivery.revoked_at,
+                Delivery.submit_token_hash,
+            )
+        )
+        row = result.first()
+        if row is not None:
+            await self.session.commit()
+            # RETURNING 已带 id/revoked_at/submit_token_hash，无需 commit 后回读
+            return True, REVOKED, row
+
+        await self.session.commit()
+        await self._lazily_expire(pickup_token_hash, now, by_submit_token=False, blind=True)
+
+        current = (
+            await self.session.execute(
+                select(Delivery).where(
+                    Delivery.token_hash == pickup_token_hash,
+                    Delivery.submit_token_hash.is_not(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if current is None:
+            return False, UNKNOWN, None
+        return False, current.status, current
+
+    async def _lazily_expire(
+        self,
+        token_hash: str,
+        now: datetime,
+        *,
+        by_submit_token: bool = False,
+        blind: bool = False,
+    ) -> bool:
+        """把已到期且仍处于可过期状态的行提升为 expired。
+
+        - by_submit_token=True 时按提交令牌列定位（提交路径），
+          否则按取件令牌列定位（取件/撤回路径）；
+        - blind=True 仅作用于盲槽，False 仅作用于普通投递：
+          两类接口的失败路径互不触及对方的行（权限不互换）。
+
+        必须在 *独立事务* 中执行：调用方的读事务可能持有旧快照
+        （SQLite/REPEATABLE READ），在其中回写过期状态会覆盖
+        并发赢家刚刚提交的终态。
+        """
+        col = Delivery.submit_token_hash if by_submit_token else Delivery.token_hash
+        if blind:
+            eligible = Delivery.status.in_((ACTIVE, PENDING))
+            scope = Delivery.submit_token_hash.is_not(None)
+        else:
+            eligible = Delivery.status == ACTIVE
+            scope = Delivery.submit_token_hash.is_(None)
+        result = await self.session.execute(
+            update(Delivery)
+            .where(col == token_hash, scope, eligible, Delivery.expires_at <= now)
             .values(status=EXPIRED, expired_at=now)
         )
         await self.session.commit()
@@ -133,12 +345,15 @@ class DeliveryStore:
         - 条件 UPDATE ... WHERE status='active' AND 未过期 是唯一裁决点。
           PostgreSQL（READ COMMITTED）用行锁串行化并发更新，仅一个事务命中。
         - 未命中即提交，绝不在同一事务里回写过期，避免旧快照覆盖赢家终态。
+        - 仅作用于普通投递（submit_token_hash IS NULL）：盲槽取件令牌在本
+          接口不具备任何权限，一律走 unknown，两类令牌不互换。
         """
         now = utcnow()
         result = await self.session.execute(
             update(Delivery)
             .where(
                 Delivery.token_hash == token_hash,
+                Delivery.submit_token_hash.is_(None),
                 Delivery.status == ACTIVE,
                 Delivery.expires_at > now,
             )
@@ -156,7 +371,10 @@ class DeliveryStore:
 
         current = (
             await self.session.execute(
-                select(Delivery).where(Delivery.token_hash == token_hash)
+                select(Delivery).where(
+                    Delivery.token_hash == token_hash,
+                    Delivery.submit_token_hash.is_(None),
+                )
             )
         ).scalar_one_or_none()
         if current is None:
@@ -168,12 +386,14 @@ class DeliveryStore:
 
         won=True 表示本次成功撤回；won=False 时 state 为
         consumed / expired / unknown（已被取走、已过期、令牌不存在）。
+        仅作用于普通投递；盲槽的撤回走 revoke_blind（凭盲槽取件令牌）。
         """
         now = utcnow()
         result = await self.session.execute(
             update(Delivery)
             .where(
                 Delivery.token_hash == token_hash,
+                Delivery.submit_token_hash.is_(None),
                 Delivery.status == ACTIVE,
                 Delivery.expires_at > now,
             )
@@ -185,7 +405,10 @@ class DeliveryStore:
             await self.session.commit()
             current = (
                 await self.session.execute(
-                    select(Delivery).where(Delivery.token_hash == token_hash)
+                    select(Delivery).where(
+                        Delivery.token_hash == token_hash,
+                        Delivery.submit_token_hash.is_(None),
+                    )
                 )
             ).scalar_one()
             return True, REVOKED, current
@@ -195,7 +418,10 @@ class DeliveryStore:
 
         current = (
             await self.session.execute(
-                select(Delivery).where(Delivery.token_hash == token_hash)
+                select(Delivery).where(
+                    Delivery.token_hash == token_hash,
+                    Delivery.submit_token_hash.is_(None),
+                )
             )
         ).scalar_one_or_none()
         if current is None:
@@ -203,10 +429,17 @@ class DeliveryStore:
         return False, current.status, current
 
     async def sweep_expired(self) -> int:
-        """后台批量标记过期（惰性过期之外的兜底），返回影响行数。"""
+        """后台批量标记过期（惰性过期之外的兜底），返回影响行数。
+
+        普通投递只在 active 上等待过期；盲槽在 pending（无人提交）或
+        active（已提交待取件）两种状态下都可能到期。
+        """
         result = await self.session.execute(
             update(Delivery)
-            .where(Delivery.status == ACTIVE, Delivery.expires_at <= utcnow())
+            .where(
+                Delivery.status.in_((ACTIVE, PENDING)),
+                Delivery.expires_at <= utcnow(),
+            )
             .values(status=EXPIRED, expired_at=utcnow())
         )
         await self.session.commit()

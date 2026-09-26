@@ -24,6 +24,52 @@ class CreateResponse(BaseModel):
     url: str = Field(description="取件地址（POST）")
 
 
+# ---------------- 盲投递请求（空槽） ----------------
+
+
+class BlindCreateRequest(BaseModel):
+    ttl_seconds: int = Field(
+        default=24 * 3600,
+        ge=1,
+        description="空槽有效期（秒），逾期未提交/未取件即过期，服务端按配置区间复验",
+    )
+
+
+class BlindCreateResponse(BaseModel):
+    slot_id: uuid.UUID = Field(description="空槽（投递）ID")
+    submit_token: str = Field(
+        description="一次性提交令牌：只能成功写入一份文本或小文件，仅此一次返回"
+    )
+    pickup_token: str = Field(
+        description="私有取件令牌：供收件人查询 pending 与原子单次取件，仅此一次返回"
+    )
+    expires_at: datetime
+    submit_url: str = Field(description="提交地址（POST，需提交令牌）")
+    pickup_url: str = Field(description="取件地址（POST，需取件令牌）")
+    revoke_url: str = Field(description="撤回地址（POST，需取件令牌）")
+
+
+class BlindSubmitTextRequest(BaseModel):
+    text: str = Field(min_length=1, description="要写入空槽的文本内容")
+
+
+class BlindSubmitResponse(BaseModel):
+    result: str = "success"  # success
+    slot_id: uuid.UUID
+    kind: str = "text"
+    content_sha256: str
+    submitted_at: datetime
+    # 刻意不含取件地址：提交者不持有取件权限，私有取件令牌只在开槽响应中出现
+
+
+class BlindPendingResponse(BaseModel):
+    """取件令牌在内容提交前查询到的明确状态。"""
+
+    result: str = "pending"
+    slot_id: uuid.UUID
+    expires_at: datetime
+
+
 class TextPickupResponse(BaseModel):
     result: str = "success"  # success
     delivery_id: uuid.UUID
@@ -34,9 +80,9 @@ class TextPickupResponse(BaseModel):
 
 
 class DenyResponse(BaseModel):
-    """取件/撤回未成功时的统一明确结果。"""
+    """取件/撤回/提交未成功时的统一明确结果。"""
 
-    result: str  # consumed | revoked | expired | unknown
+    result: str  # consumed | revoked | expired | unknown | submitted | pending
     detail: str
 
 

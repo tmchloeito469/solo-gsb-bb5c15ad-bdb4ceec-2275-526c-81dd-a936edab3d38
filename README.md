@@ -4,8 +4,13 @@
 收件人凭令牌取件，**内容只能被成功读取一次**。并发取件时仅有一个请求得到内容，
 其余请求以及「已撤回 / 已过期 / 已消费」都会得到明确、可区分的结果。
 
+此外支持**盲投递请求（Blind Submission Request）**：收件人先创建一个**空投递槽**，
+对外只分发一次性**提交令牌**，自己保留私有**取件令牌**。任何拿到提交令牌的人都可以
+投递一份文本或小文件，但**并发下只有一个提交者能成功写入**；取件令牌在内容提交前
+查询得到 `pending`，提交后沿用同一套原子单次取件语义。
+
 - **FastAPI**（异步 HTTP + 自动 OpenAPI 文档）
-- **PostgreSQL**：投递内容与审计的唯一可信存储，**原子消费的最终裁决者**
+- **PostgreSQL**：投递内容与审计的唯一可信存储，**原子消费/原子提交的最终裁决者**
 - **Redis**：终态快速拒绝缓存（best-effort，宕机不影响正确性）
 - 令牌只存 SHA-256 哈希；明文令牌仅在创建响应中出现一次
 
@@ -47,6 +52,11 @@ docker compose down -v
 | `POST` | `/api/v1/deliveries/file` | 创建小文件投递（multipart/form-data） |
 | `POST` | `/api/v1/pickup/{token}` | 凭令牌取件（**只能成功一次**） |
 | `POST` | `/api/v1/revoke/{token}` | 发送者撤回投递 |
+| `POST` | `/api/v1/blind-slots` | **盲投递**：收件人创建空槽，返回提交令牌 + 私有取件令牌 |
+| `POST` | `/api/v1/blind-slots/submit/{submit_token}` | **盲投递**：凭提交令牌写入文本（并发仅一人成功） |
+| `POST` | `/api/v1/blind-slots/submit/{submit_token}/file` | **盲投递**：凭提交令牌写入小文件 |
+| `POST` | `/api/v1/blind-slots/pickup/{token}` | **盲投递**：收件人取件（提交前 `pending`，提交后原子单次） |
+| `POST` | `/api/v1/blind-slots/revoke/{token}` | **盲投递**：收件人凭取件令牌撤回空槽/已提交投递 |
 | `GET` | `/api/v1/audit/export` | 按时间范围导出审计链记录（**NDJSON 流**，只读） |
 | `GET` | `/api/v1/audit/verify` | 校验库内审计链完整性（只读） |
 | `POST` | `/api/v1/audit/verify` | 校验一份导出的 NDJSON（按行顺序，可发现乱序） |
@@ -66,6 +76,17 @@ docker compose down -v
 
 撤回接口：成功 `200 {"result":"revoked"}`；已被取走或已过期返回 `410`
 （`result` 为 `consumed` / `expired`）；令牌不存在 `404`。
+
+### 盲投递的额外结果
+
+| `result` | 出现接口 | 含义 | HTTP 状态码 |
+| --- | --- | --- | --- |
+| `pending` | 盲槽取件 | 空槽已创建，但尚无提交者写入内容（不消费取件令牌，可反复查询） | `200` |
+| `submitted` | 盲槽提交 | 空槽已被**另一个提交者**成功写入，提交令牌只能成功使用一次 | `409 Conflict` |
+
+盲槽提交失败：`submitted` / `revoked` 返回 `409`，`expired` 返回 `410`，
+提交令牌不存在（或拿取件令牌来提交）返回 `404 unknown`。盲槽取件/撤回的
+其余结果与普通投递一致。
 
 ---
 
@@ -144,6 +165,107 @@ curl -s -X POST "http://localhost:8000/api/v1/revoke/<token>"
 
 ---
 
+## 盲投递请求（收件人开槽，提交者竞写一份）
+
+适用场景：收件人希望别人**主动投递**一份内容给自己，但事先不知道谁会投递；
+需要保证自己是唯一能取件的人，并且多个候选提交者中只有一个能写入。
+
+### 5) 收件人创建空槽
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/blind-slots \
+  -H 'Content-Type: application/json' \
+  -d '{"ttl_seconds": 3600}'
+```
+
+响应中**两个令牌都只出现这一次**，请分别保存：
+
+```json
+{
+  "slot_id": "3b2e…",
+  "submit_token": "kH7q…一次性提交令牌…",
+  "pickup_token": "Wd9X…收件人私有取件令牌…",
+  "expires_at": "2026-09-21T11:00:00Z",
+  "submit_url": "http://localhost:8000/api/v1/blind-slots/submit/kH7q…",
+  "pickup_url": "http://localhost:8000/api/v1/blind-slots/pickup/Wd9X…",
+  "revoke_url": "http://localhost:8000/api/v1/blind-slots/revoke/Wd9X…"
+}
+```
+
+收件人把 `submit_url`（或 `submit_token`）通过任意渠道发给一个或多个候选提交者，
+**自己保留 `pickup_token`**。提交者无法从提交令牌推知取件令牌，也无法取件。
+
+### 6) 提交者投递内容（文本）
+
+```bash
+curl -s -X POST "http://localhost:8000/api/v1/blind-slots/submit/kH7q…" \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "这是只会被收件人读到一次的盲投内容"}'
+```
+
+成功（`200`；注意响应**不包含**任何取件地址或取件令牌）：
+
+```json
+{
+  "result": "success",
+  "slot_id": "3b2e…",
+  "kind": "text",
+  "content_sha256": "…",
+  "submitted_at": "2026-09-21T10:20:33Z"
+}
+```
+
+小文件走 multipart：
+
+```bash
+curl -s -X POST "http://localhost:8000/api/v1/blind-slots/submit/kH7q…/file" \
+  -F 'file=@/path/to/sealed.pdf'
+```
+
+若另一个提交者已经抢先写入，后续提交得到明确结果，且槽中内容永远是赢家那份：
+
+```json
+// HTTP 409 Conflict
+{"result": "submitted", "detail": "该空槽已有提交者成功写入，提交令牌只能成功使用一次。"}
+```
+
+收件人撤回后提交：`409 {"result":"revoked"}`；空槽过期后提交：`410 {"result":"expired"}`。
+
+### 7) 收件人取件（提交前 pending，提交后单次成功）
+
+内容尚未提交时，取件令牌不报错、不消费，返回明确的 `pending`（HTTP 200）：
+
+```bash
+curl -s -X POST "http://localhost:8000/api/v1/blind-slots/pickup/Wd9X…"
+# {"result":"pending","slot_id":"3b2e…","expires_at":"2026-09-21T11:00:00Z"}
+```
+
+提交完成后，同一接口即按普通取件的规则**原子单次**返回内容
+（文本为 JSON，文件为带 `X-Content-SHA256` 头的二进制流）；再次取件得到
+`410 {"result":"consumed"}`。
+
+### 8) 收件人撤回
+
+```bash
+# 空槽阶段撤回：阻止一切后续提交
+# 已提交待取件阶段撤回：内容不再可被取走
+curl -s -X POST "http://localhost:8000/api/v1/blind-slots/revoke/Wd9X…"
+# 200 {"result":"revoked", ...}；重复撤回 200 {"result":"already_revoked"}
+```
+
+### 两类令牌的权限隔离
+
+- 提交令牌与取件令牌分别独立生成（均为 32 字节 `secrets.token_urlsafe`），
+  **分别做 SHA-256 哈希、存于不同列、各有独立唯一索引**；
+- 提交接口只按提交令牌列定位盲槽；取件/撤回只按取件令牌列且仅匹配盲槽；
+- **任何交叉使用都返回 `404 unknown`**：拿取件令牌提交、拿提交令牌取件/撤回、
+  把盲槽令牌用于普通投递接口、把普通投递令牌用于盲槽接口，均无任何权限；
+- Redis 终态缓存也按令牌类型使用独立键前缀，一个接口的终态不会在另一个
+  接口上被命中；
+- 提交成功响应刻意不回传取件地址，提交者无法借此获知取件能力。
+
+---
+
 ## 并发原子消费是如何保证的
 
 这是本服务的核心。正确性**只依赖 PostgreSQL 的单条条件更新**，不依赖应用层锁：
@@ -178,6 +300,41 @@ RETURNING id, content, …;
 要么内容被取走（撤回得到 `consumed`），要么撤回先成功（取件得到 `revoked`），
 不会出现“既取走又撤回”。
 
+### 盲槽提交的并发裁决与状态机
+
+盲槽复用同一张 `deliveries` 表与同一种裁决模式。空槽是一行
+`status='pending'`、内容为 `NULL` 的记录，提交就是一条把**内容写入与状态迁移
+合并在一起**的条件更新：
+
+```sql
+UPDATE deliveries
+SET status = 'active',
+    kind = :kind, content = :content, content_size = :size,
+    content_sha256 = :digest, submitted_at = now
+WHERE submit_token_hash = :submit_token_hash
+  AND status = 'pending'
+  AND expires_at > now
+RETURNING id, submitted_at, …;
+```
+
+- 多个提交者并发执行时，行锁只放行**一个**事务，槽原子地从 `pending` 变为
+  `active` 且内容一次写入——不会出现“状态已激活但内容为空”的半成品；
+- 其余提交者 `WHERE` 不再匹配（槽已是 `active`，或紧接取件后为 `consumed`），
+  统一得到明确的 `submitted`；撤回/过期竞争分别得到 `revoked` / `expired`；
+- 提交前的取件请求只读到 `pending`，**不做任何状态迁移**，因此可反复查询；
+  提交后的取件请求与普通投递完全相同（`active → consumed` 条件更新，单次）；
+- 撤回对 `pending` 与 `active` 两种状态都成立；过期清扫同时覆盖这两种状态。
+
+盲槽完整状态机（粗体为盲投递新增）：
+
+```
+                 提交（条件更新，唯一赢家）
+ pending ───────────────────────────────► active ──取件──► consumed
+    │                                        │
+    ├────── 撤回 ──────► revoked ◄───────────┘
+    └── 过期 ──► expired ◄──── active 到期（提交后未取件同样过期）
+```
+
 ---
 
 ## 审计与可验证完整性（哈希链）
@@ -185,10 +342,14 @@ RETURNING id, content, …;
 所有关键动作写入 `audit_logs` 表，并且**每一条新日志（包括未知令牌等失败
 请求）都在同一个 PostgreSQL 事务中加入一条只增哈希链**：
 
-- 动作：`create` / `pickup` / `revoke`
-- 结果：`success` / `consumed` / `revoked` / `expired` / `unknown`
+- 动作：`create` / `pickup` / `revoke`，以及盲投递的
+  `blind_create` / `blind_submit` / `blind_pickup` / `blind_revoke`
+- 结果：`success` / `consumed` / `revoked` / `expired` / `unknown` /
+  `pending` / `submitted`
 - 关联 `delivery_id`（可空）、`token_hash`、客户端 IP、User-Agent、时间与少量详情
 - **未知令牌的尝试也留痕并入链**（`delivery_id` 为空、仅记录哈希），便于暴力探测审计
+- 盲槽创建审计记录取件令牌哈希，并在 `detail.submit_token_hash` 中留存提交令牌
+  哈希；提交类审计只记录提交令牌哈希，取件/撤回类审计只记录取件令牌哈希
 
 明文内容不写入审计，也不会出现在任何导出/校验数据中。
 
@@ -283,8 +444,12 @@ curl -s -X POST --data-binary @audit.ndjson \
 ### 数据模型要点
 
 - 令牌为 32 字节 `secrets.token_urlsafe(32)`，库中仅存其 **SHA-256**；
+- 盲槽额外存一列 `submit_token_hash`（提交令牌哈希，独立唯一索引，普通投递为 NULL）；
+  空槽阶段 `content` 为 NULL、`kind='pending'`、`status='pending'`，
+  提交成功的同一条 UPDATE 写入内容并置 `status='active'`、`submitted_at`；
 - 内容存 PostgreSQL `bytea`，同时记录大小与 SHA-256；
-- 状态机：`active → consumed | revoked | expired`，单向不可逆；
+- 状态机：`pending（盲槽）→ active → consumed | revoked | expired`，
+  其中 `pending/active → revoked | expired`，单向不可逆；
 - `(status, expires_at)` 与 `token_hash` 建有索引，支撑并发判定与清扫；
 - `audit_logs` 额外保存 `seq / event_digest / prev_hash / entry_hash`
   （链字段），链游标存于单行表 `audit_chain_state`，表结构在启动时
@@ -319,7 +484,10 @@ pytest
 
 测试套件使用文件型 SQLite（WAL，多连接真实争抢写锁）+ `fakeredis`，
 包含 **50 路并发取件仅有一个赢家**、**取件/撤回并发互斥**、撤回、过期、
-文件一次性下载、未知令牌与审计留痕，以及**哈希链入链/导出 NDJSON/五类
+文件一次性下载、未知令牌与审计留痕，以及**盲投递全流程**（空槽 pending、
+一次性提交、**50 路并发提交仅一人成功其余均为 submitted**、提交/撤回竞争、
+撤回阻断提交与取件、pending/active 过期、两类令牌八个方向交叉使用全部
+`unknown`、提交成功响应不回传取件能力）和**哈希链入链/导出 NDJSON/五类
 篡改检测（缺行、乱序、重复、字段改写、链断裂并指出第一处）/40 路并发
 写入序号严格连续/链游标竞态失配重试**等用例。另在真实 PostgreSQL 上验证过
 100 路并发取件恰好 1 个赢家、30 组取件/撤回互斥。
@@ -330,6 +498,10 @@ pytest
 
 - 取件令牌是唯一的“能力凭证”：知道令牌即可取件，因此应通过私密渠道发送；
   库中不存明文令牌，泄露数据库无法反推取件地址。
+- 盲投递的提交令牌与取件令牌是两种**权限不同**的能力凭证：提交令牌只能竞写
+  一次内容，取件令牌才能查询/取件/撤回；二者分别哈希、分别索引，接口层按列
+  与状态严格限定，任何交叉使用一律 `unknown`。公开分发提交令牌是安全的（在
+  信任“先到先得”语义的前提下），取件令牌必须由收件人保密。
 - 默认内容上限 1 MiB，面向“文本或小文件”；大文件投递不在设计范围内。
 - 本服务不含发送者身份认证/速率限制，生产部署建议放在鉴权网关之后并自行限流。
 - 表结构在启动时自动 `CREATE TABLE`（简单场景不引入迁移工具）。

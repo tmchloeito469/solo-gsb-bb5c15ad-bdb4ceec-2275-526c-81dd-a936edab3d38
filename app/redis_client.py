@@ -17,6 +17,9 @@ import redis.asyncio as aioredis
 from .config import settings
 
 _FLAG_PREFIX = "drop:flag:"
+# 提交令牌的终态标记独立命名空间：提交令牌与取件令牌分别哈希、分别索引，
+# 快速拒绝缓存也不得互相命中，避免一个接口的终态泄露到另一个接口。
+_SUBMIT_FLAG_PREFIX = "drop:submit-flag:"
 
 # Lua：仅当没有标记时写入，保证并发下终态不会被互相覆盖
 _SET_IF_ABSENT = """
@@ -37,6 +40,10 @@ class DenyCache:
     def _key(token_hash: str) -> str:
         return f"{_FLAG_PREFIX}{token_hash}"
 
+    @staticmethod
+    def _submit_key(token_hash: str) -> str:
+        return f"{_SUBMIT_FLAG_PREFIX}{token_hash}"
+
     async def get_flag(self, token_hash: str) -> str | None:
         value = await self.redis.get(self._key(token_hash))
         if value is None:
@@ -52,6 +59,21 @@ class DenyCache:
 
     async def set_flag(self, token_hash: str, flag: str, ttl_seconds: int) -> None:
         await self.redis.set(self._key(token_hash), flag, ex=ttl_seconds)
+
+    async def get_submit_flag(self, token_hash: str) -> str | None:
+        value = await self.redis.get(self._submit_key(token_hash))
+        if value is None:
+            return None
+        return value.decode() if isinstance(value, bytes) else str(value)
+
+    async def set_submit_flag_if_absent(
+        self, token_hash: str, flag: str, ttl_seconds: int
+    ) -> bool:
+        """提交令牌终态标记：原子地“仅在不存在时设置”。"""
+        result = await self.redis.eval(
+            _SET_IF_ABSENT, 1, self._submit_key(token_hash), flag, int(ttl_seconds * 1000)
+        )
+        return int(result) == 1
 
     async def ping(self) -> None:
         await self.redis.ping()
